@@ -6,13 +6,15 @@ seed_set()
 
 def main():
     # 配置文件选择开关
-    # CONFIG_TYPE = "cifar_in21k_ncmloss"
-    CONFIG_TYPE = "cifar_in21k_ncmacm"
+    CONFIG_TYPE = "cifar_in21k_ncmloss"
+    # CONFIG_TYPE = "cifar_in21k_mine11"
+
+    CONFIG_TYPE = "cub_in21k_ncmloss"
 
     config_map = {
         "cifar_in21k_ncmloss": "exps/cifar/cifar_in21k_ncmloss.json",
-        "cifar_in21k_ncmacm": "exps/cifar/cifar_in21k_ncmacm.json",
-        "imagenet": "exps/imagenet/imagenet_config.json"
+        "cifar_in21k_mine11": "exps/cifar/cifar_in21k_mine11.json",
+        "cub_in21k_ncmloss": "exps/cub/cub_in21k_ncmloss.json"
     }
 
     # 指定配置文件路径

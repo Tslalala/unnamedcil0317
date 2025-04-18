@@ -61,6 +61,7 @@ class DataManager(object):
         # Transforms
         self._train_trsf = idata.train_trsf
         self._test_trsf = idata.test_trsf
+        self._strong_trsf = idata.strong_trsf
         self._common_trsf = idata.common_trsf
 
         # 是否打乱class_order
@@ -96,9 +97,11 @@ class DataManager(object):
                 *self._test_trsf,
                 transforms.RandomHorizontalFlip(p=1.0),
                 *self._common_trsf,
-                ])
+            ])
         elif mode == "test":
             trsf = transforms.Compose([*self._test_trsf, *self._common_trsf])
+        elif mode == "strong":
+            trsf = transforms.Compose([*self._strong_trsf, *self._common_trsf])
         else:
             raise ValueError("Unknown mode {}.".format(mode))
 

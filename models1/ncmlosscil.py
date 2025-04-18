@@ -6,7 +6,7 @@ from tqdm import tqdm
 from torch import optim
 from torch.nn import functional as F
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 
 from convs.losses import NCMLoss
 import timm
@@ -54,6 +54,12 @@ class Learner:
         train_dataset = data_manager.get_dataset(indices=train_indices, source="train", mode="train", )
         self.train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
+        sa_dataset = data_manager.get_dataset(indices=train_indices, source="train", mode="strong", )
+        sa_dataset1 = data_manager.get_dataset(indices=train_indices, source="train", mode="strong", )
+        sa_dataset2 = data_manager.get_dataset(indices=train_indices, source="train", mode="strong", )
+        combined_dataset = ConcatDataset([sa_dataset, sa_dataset1, sa_dataset2])
+        self.sa_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
         test_dataset = data_manager.get_dataset(indices=test_indices, source="test", mode="test")
         self.test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
@@ -65,20 +71,38 @@ class Learner:
     def _train(self,):
         self._network = self.call_model()
         if self.prompt_pool != []:
-            self._network.load_prompt(self.prompt_pool[0])
+            self._network.load_prompt(self.prompt_pool[-1])
             self._network.to(self._device)
+            self._old_network.load_prompt(self.prompt_pool[-1])
+            self._old_network.to(self._device)
         self._network.eval()
 
         # 推理
-        bias = 10 * torch.randn(768)
-        feature_proto_list = [torch.randn(768) + bias for num in self.cur_classes]
-        # feature_proto_list = toolkits.get_protos_with_tqdm(self.train_loader_for_protonet, self._device, self._network)
+        # bias = 10 * torch.randn(768)
+        # feature_proto_list = [torch.randn(768) + bias for num in self.cur_classes]
+        feature_proto_list = toolkits.get_protos_with_tqdm(self.train_loader_for_protonet, self._device, self._network)
         self.previous_feature_proto_list = [] if self._known_classes == 0 else self.feature_proto_list
         self.feature_proto_list = feature_proto_list if self._known_classes == 0 else self.feature_proto_list + feature_proto_list
         self.prototypes = torch.stack(self.feature_proto_list).to(self._device)
 
-        self.train_vpt()
-        self._network.eval()
+        # 测试
+        train_accuracy = toolkits.test_accuracy(model=self._network, data_loader=self.train_loader_for_protonet,
+                               prototypes=self.prototypes, epoch=-1,
+                               num_epochs=0, device=self._device, words='SHOW Train')
+        toolkits.test_accuracy(model=self._network, data_loader=self.test_loader,
+                               prototypes=self.prototypes, epoch=-1,
+                               num_epochs=0, device=self._device, words='SHOW Test')
+
+        if self._cur_task < 10 and train_accuracy < 97.5:
+            if self._cur_task < len(self.args["merge_epoch"]):
+                merge_epoch = self.args["merge_epoch"][self._cur_task]
+            else:
+                merge_epoch = self.args["merge_epoch"][-1]
+            for _ in range(merge_epoch):
+                print(f'Here comes the {_} train_vpt')
+                test_acc = self.train_vpt()
+                if test_acc > 98.5 - self._cur_task/4:
+                    break
 
     def train_vpt(self,):
         # 参数初始化
@@ -90,14 +114,15 @@ class Learner:
         # train meta parameters
         lrs = self.args["lr_prompt"]
         if self._cur_task > len(lrs) - 1:
-            lr_ = 5.0e-6
+            lr_ = self.args["lr_final"]
         else:
             lr_ = lrs[self._cur_task]
         optimizer = optim.SGD(self._network.parameters(), momentum=0, lr=lr_, weight_decay=5e-4)
         loss_fn = NCMLoss()
+        loss_fn_mse = nn.MSELoss()
 
         # 训练VPT
-        loss_average_min = np.inf
+        train_accuracy = 0.0
         train_accuracy_max = 0.0
         prompt_ = None
         for epoch in range(self.args["tuned_epoch"]):
@@ -114,43 +139,57 @@ class Learner:
                     outputs = self._network(inputs)
 
                     # 准备tsne数据
-                    target_long = targets.long().detach().squeeze()
-                    if batch_counter == 0:
-                        feature_bank, target_bank = outputs.detach().cpu(), target_long.detach().cpu()
-                    else:
-                        feature_bank = torch.cat((feature_bank, outputs.detach().cpu()), dim=0)
-                        target_bank = torch.cat((target_bank, target_long.detach().cpu()), dim=0)
+                    # target_long = targets.long().detach().squeeze()
+                    # if batch_counter == 0:
+                    #     feature_bank, target_bank = outputs.detach().cpu(), target_long.detach().cpu()
+                    # else:
+                    #     feature_bank = torch.cat((feature_bank, outputs.detach().cpu()), dim=0)
+                    #     target_bank = torch.cat((target_bank, target_long.detach().cpu()), dim=0)
 
                     # ==================== 计算含约束的强loss ====================
                     # loss = loss_fn.modified_loss_fn_(
-                    #         current_inputs = inputs,
-                    #         current_labels = targets,
-                    #         prototypes = self.prototypes,
-                    #         classes_per_task = self.classes_per_task,
-                    #         current_task_id = self._cur_task,
-                    #         prompt_pool = self.prompt_pool,
-                    #         old_networks = self._old_network,
-                    #         current_outputs = outputs,
-                    #         )
-
-                    # ==================== 弱loss ====================
-                    # 获取所有旧模型输出
-                    old_features_list = []
-                    for old_prompt in self.prompt_pool:  # 遍历保存的历史prompt
-                        self._old_network.load_prompt(old_prompt)  # 加载旧prompt
-                        self._old_network.to(self._device)
-                        with torch.no_grad():
-                            old_outputs = self._old_network(inputs)  # 旧模型推理
-                        old_features_list.append(old_outputs)
-                    loss = loss_fn.modified_loss_fn(
-                        current_features=outputs,
-                        old_features_list=old_features_list,
-                        labels=targets,
-                        prototypes=self.prototypes,
-                    )
+                    #     current_inputs=inputs,
+                    #     current_labels=targets,
+                    #     prototypes=self.prototypes,
+                    #     classes_per_task=self.classes_per_task,
+                    #     current_task_id=self._cur_task,
+                    #     prompt_pool=self.prompt_pool,
+                    #     old_networks=self._old_network,
+                    #     current_outputs=outputs,
+                    # )
 
                     # ==================== 最弱loss ====================
-                    # loss = loss_fn.forward(features=outputs, labels=targets, prototypes=self.prototypes)
+                    loss = loss_fn.forward(features=outputs, labels=targets, prototypes=self.prototypes)
+
+                    # ==================== 通用性loss ====================
+                    grad_accum_steps = 1  # 对应4个batch的梯度累加
+                    if self.prompt_pool != []:
+                        total_loss_g = 0.0
+                        # 通过迭代器遍历4个batch（显存占用仅等效单个batch）
+                        sa_loader_iter = iter(self.sa_loader)
+                        for accum_step in range(grad_accum_steps):
+                            try:
+                                _, inputs, targets = next(sa_loader_iter)
+                            except StopIteration:
+                                sa_loader_iter = iter(self.sa_loader)  # 循环加载数据
+                                _, inputs, targets = next(sa_loader_iter)
+
+                            inputs = inputs.to(self._device, non_blocking=True)
+
+                            # 混合精度计算（显存节省30%-50%）
+                            with torch.amp.autocast('cuda'):
+                                old_outputs = self._old_network(inputs)
+                                new_outputs = self._network(inputs)
+                                loss_g = loss_fn_mse(old_outputs, new_outputs) / grad_accum_steps  # 梯度标准化
+
+                            # 梯度累加
+                            total_loss_g += loss_g
+
+                            # 显存立即释放（关键）
+                            del old_outputs, new_outputs, inputs
+                            torch.cuda.empty_cache()  # 强制回收碎片显存
+
+                        loss += total_loss_g
 
                     # 反向传播
                     loss.backward()
@@ -170,13 +209,14 @@ class Learner:
             # 测试
             train_accuracy = toolkits.test_accuracy(model=self._network, data_loader=self.train_loader_for_protonet,
                                                     prototypes=self.prototypes, epoch=epoch,
-                                                    num_epochs=self.args["tuned_epoch"], device=self._device, words='Train')
+                                                    num_epochs=self.args["tuned_epoch"], device=self._device,
+                                                    words='Train')
 
             # 绘tsne图
-            toolkits.tsne_classes(feature_bank, target_bank)
+            # toolkits.tsne_classes(feature_bank, target_bank)
 
             # 终止epoch loop
-            if train_accuracy > 97.5:   # > 97.5
+            if train_accuracy > 100 - self._cur_task/4:   # > 97.5
                 prompt_ = self._network.obtain_prompt()
                 break
             if train_accuracy > train_accuracy_max:
@@ -185,12 +225,36 @@ class Learner:
                 # print(f'train accuracy is {train_accuracy}, save prompt {prompt_}')
 
         # 做Prompt的Merging
-        # if self.prompt_pool != []:
-        #     alpha = 1 / self._cur_task
-        #     prompt_ = toolkits.weighted_prompt_average(self.prompt_pool[-1], prompt_, alpha)
+        merge = True
+        test_acc = 100. # 100.
+        if merge and self._cur_task != 0:
+            if self.prompt_pool != []:
+                # alpha = 1 / (self._cur_task + 1)
+                beta = 1. - self._cur_task/30
+                alpha = max(0.5 - self._cur_task/30, 0.1)
+                prompt_ = toolkits.weighted_prompt_average(self.prompt_pool[-1], prompt_, alpha, beta) # (1 - alpha) * prompt_old + alpha * prompt_new
+            self._network.load_prompt(prompt_)  # 再次推理得到新的prototypes
+            self._network.to(self._device)
+            feature_proto_list = toolkits.get_protos_with_tqdm(self.train_loader_for_protonet, self._device,
+                                                               self._network)
+            self.feature_proto_list = self.previous_feature_proto_list + feature_proto_list
+            self.prototypes = torch.stack(self.feature_proto_list).to(self._device)
+            # toolkits.test_accuracy(model=self._network, data_loader=self.train_loader_for_protonet,
+            #                        prototypes=self.prototypes, device=self._device, words='Merge')
+            test_acc = toolkits.test_accuracy(model=self._network, data_loader=self.test_loader,
+                                   prototypes=self.prototypes, device=self._device, words='Test')
+
+        # Prototypes Drift Predict
+        prototypes_drift = True
+        if prototypes_drift:
+            if 0 < self._cur_task < self.args["task_stop_p_drift"]:
+                self.get_prototypes_drift(prompt_ = prompt_)
+                self.feature_proto_list = self.previous_feature_proto_list + feature_proto_list
+                self.prototypes = torch.stack(self.feature_proto_list).to(self._device)
 
         # 保存prompt_token
         self.prompt_pool.append(prompt_)
+        return test_acc
 
 
     # ----------------------------------------------------------------
@@ -198,49 +262,106 @@ class Learner:
     # ----------------------------------------------------------------
     def eval_accuracy(self, words='Test', top_num=1):
         model = self._network
+        model.load_prompt(self.prompt_pool[-1])
+        model.to(self._device)
         data_loader = self.test_loader
-        num_classes = self.prototypes.size(0)  # 总类别数
-        with tqdm(total=len(data_loader), desc=f"Task{words}", ncols=120) as pbar_test:
-            y_pred, y_true = [], []
-            with torch.no_grad():
-                for _, inputs, targets in data_loader:
-                    inputs, targets = inputs.to(self._device), targets.to(self._device)
-                    batch_size = inputs.size(0)
-                    total_similarities = torch.zeros(batch_size, num_classes).to(self._device)  # 存储累积相似度
+        test_acc = toolkits.test_accuracy(model=model, data_loader=data_loader,
+                                prototypes=self.prototypes, device=self._device, words='Test')
 
-                    # 遍历每个Prompt并累积相似度
-                    for task_id, prompt in enumerate(self.prompt_pool):
-                        model.load_prompt(prompt)  # 确保模型支持动态加载Prompt
-                        model.to(self._device)
-                        model.eval()
-                        outputs = model(inputs)  # [batch_size, feature_dim]
+        # ------------------------------------------------------------------
+        # TSNE
+        # ------------------------------------------------------------------
+        # for batch_counter, (_, inputs, targets) in enumerate(data_loader):
+        #     inputs, targets = inputs.to(self._device), targets.to(self._device)
+        #
+        #     # 前向传播
+        #     outputs = model(inputs)
 
-                        # 获取该任务对应的类索引范围（从记录的classes_per_task中读取）
-                        task_class_indices = self.classes_per_task[task_id]  # 例如[0,1,2,3,4]或[5,6,7,8,9]
-                        start_idx = min(task_class_indices)
-                        end_idx = max(task_class_indices) + 1  # 包含末端索引
+            # # 准备tsne数据
+            # target_long = targets.long().detach().squeeze()
+            # if batch_counter == 0:
+            #     feature_bank, target_bank = outputs.detach().cpu(), target_long.detach().cpu()
+            # else:
+            #     feature_bank = torch.cat((feature_bank, outputs.detach().cpu()), dim=0)
+            #     target_bank = torch.cat((target_bank, target_long.detach().cpu()), dim=0)
 
-                        # 提取该任务对应的原型 [n_classes_in_task, feature_dim]
-                        task_prototypes = self.prototypes[start_idx:end_idx]
+        # 绘tsne图
+        # toolkits.tsne_classes(feature_bank, target_bank)
 
-                        # 批量计算与所有原型的L2距离（高效向量化）
-                        temperature = 1.0
-                        distances = torch.cdist(outputs, task_prototypes, p=2)  # [batch_size, num_classes]
-                        similarities = - distances / temperature  # 距离转换为相似度
+        return test_acc
 
-                        # 将相似度填充到总矩阵的对应位置
-                        total_similarities[:, start_idx:end_idx] += similarities
+    def get_prototypes_drift(self, prompt_):
+        self._old_network.load_prompt(self.prompt_pool[-1])
+        self._old_network.to(self._device)
+        self._old_network.eval()
+        self._network.load_prompt(prompt_)
+        self._network.to(self._device)
+        self._network.eval()
 
-                    # 取Top-K预测结果（综合所有Prompt）
-                    _, top_indices = torch.topk(total_similarities, k=top_num, dim=1)
-                    batch_preds = top_indices.cpu().tolist()  # 取Top1预测
+        # 修改后（即时转CPU+释放显存）
+        old_features_list, new_features_list = [], []
+        with torch.no_grad():  # 禁用梯度计算
+            for _, inputs, targets in self.train_loader_for_protonet:
+                inputs = inputs.to(self._device)
+                # 提取后立即转CPU并释放GPU显存
+                old_features = self._old_network(inputs).cpu()
+                new_features = self._network(inputs).cpu()
+                old_features_list.append(old_features)
+                new_features_list.append(new_features)
+                del inputs, old_features, new_features  # 及时删除变量
 
-                    y_pred.extend(batch_preds)
-                    y_true.extend(targets.cpu().tolist())
+        # 以old_features_list为inputs，以new_features_list为target构造数据集
+        feature_dataset = toolkits.FeatureDataset(old_features_list, new_features_list)
+        dp_loader = DataLoader(feature_dataset, batch_size=32, shuffle=True)
 
-                    # 更新进度条
-                    test_accuracy = 100 * toolkits.top_k_accuracy(y_pred, y_true, k=1)
-                    pbar_test.set_postfix(accuracy=f"{test_accuracy:.2f}%")
-                    pbar_test.update(1)
+        # train DP_network
+        num_epochs = 400
+        DP_network = DriftPredictNetwork(input_dim=768, hidden_dim=256).to(self._device)
+        optimizer = torch.optim.SGD(DP_network.parameters(), lr=1e-1)
+        loss_fn = torch.nn.MSELoss()
+        for epoch in range(num_epochs):
+            losses = 0.0
+            for inputs, targets in dp_loader:
+                inputs, targets = inputs.to(self._device), targets.to(self._device)
 
-        return test_accuracy
+                optimizer.zero_grad()
+                outputs = DP_network(inputs)
+                loss = loss_fn(outputs, targets)
+                loss.backward()
+                optimizer.step()
+
+                losses += loss.item()
+
+            # 记录历史损失
+            if epoch % 50 == 0 or epoch > num_epochs - 4:
+                print(f'Epoch{epoch+1} losses:{losses:3f}', end='; ')
+            if losses < .08:
+                break
+        print()
+
+        # 预测漂移后的prototypes
+        old_prototypes = torch.stack(self.previous_feature_proto_list).to(self._device)
+        new_prototypes = DP_network(old_prototypes)
+        self.previous_feature_proto_list = list(new_prototypes.cpu().detach().unbind(0))
+
+
+# 设计以预测prototypes漂移
+class DriftPredictNetwork(nn.Module):
+    def __init__(self, input_dim, hidden_dim=16):
+        super().__init__()
+        # 编码层
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim)
+        )
+
+        # 预测头
+        self.predictor = nn.Linear(hidden_dim, input_dim)
+
+    def forward(self, old_prototype):
+        x = self.encoder(old_prototype)
+        return 0.1 * self.predictor(x) + old_prototype

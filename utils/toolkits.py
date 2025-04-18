@@ -13,12 +13,13 @@ from sklearn.manifold import TSNE
 import os
 
 from . import data_category
+from convs.adapter import Adapter, VisionTransformer
 
 
-def seed_set():
-    torch.manual_seed(1)  # 影响CPU上随机操作
-    torch.cuda.manual_seed(1)  # 影响GPU上随机操作
-    torch.cuda.manual_seed_all(1)  # 影响多GPU上随机操作
+def seed_set(seed=1):
+    torch.manual_seed(seed)  # 影响CPU上随机操作
+    torch.cuda.manual_seed(seed)  # 影响GPU上随机操作
+    torch.cuda.manual_seed_all(seed)  # 影响多GPU上随机操作
     torch.backends.cudnn.deterministic = True  # CuDNN库以确定性模式运行,在 GPU 上相同的输入将会产生相同的输出
     torch.backends.cudnn.benchmark = False  # 禁用了CuDNN自动基准测试功能。启用时CuDNN会在多个卷积算法中选择最快的一个,可能会导致每次运行时选择不同的算法
     np.random.seed(1993)
@@ -92,9 +93,9 @@ def get_model(model_name, args):
         from models1.ncmlosscil import Learner
         print('--model ncmlosscil')
         return Learner(args)
-    elif name == 'ncmacmcil':
-        from models1.ncmacmcil import Learner
-        print('--model ncmacmcil')
+    elif name == 'mine11':
+        from models1.mine11cil import Learner
+        print('--model mine11')
         return Learner(args)
     else:
         raise NotImplementedError("Unknown model {}.".format(model_name))
@@ -169,6 +170,7 @@ def top_k_accuracy(y_pred, y_true, k):
 
 
 def get_protos_with_tqdm(data_loader, device, model):
+    model.to(device)
     embedding_list = []
     label_list = []
     with torch.no_grad():
@@ -217,6 +219,7 @@ def get_protos(data_loader, device, model):
 
 
 def test_accuracy(model, data_loader, prototypes, epoch=-1, num_epochs=0, device='cuda', words='Test', top_num=2):
+    model.eval()
     with tqdm(total=len(data_loader), desc=f"{words} Epoch [{epoch + 1}/{num_epochs}]",
               ncols=120) as pbar_test:
         y_pred, y_true = [], []
@@ -289,57 +292,7 @@ def tsne_classes(feature_bank, target_bank):
     plt.show()
 
 
-def modified_loss_fn(current_features,
-                     old_features_list,
-                     labels,
-                     prototypes,
-                     current_loss_weight=1.0,
-                     old_consistency_weight=0.12,
-                     temperature=1.0):
-    """
-    改进的损失函数，整合当前任务损失和旧模型一致性约束
-
-    Args:
-        current_features (Tensor): 当前模型输出特征 [B, D]
-        old_features_list (List[Tensor]): 历史模型输出特征列表 [n_old_models, B, D]
-        labels (Tensor): 当前批次标签 [B]
-        prototypes (Tensor): 所有类原型 [C, D]
-        current_loss_weight (float): 当前分类损失权重
-        old_consistency_weight (float): 旧模型一致性约束权重
-        temperature (float): 相似度分布温度系数
-
-    Returns:
-        total_loss (Tensor): 整合后的总损失
-    """
-    # 原始分类损失（当前模型）
-    distances = torch.cdist(current_features, prototypes, p=2)  # [B, C]
-    logits = -distances / temperature
-    loss_current = F.cross_entropy(logits, labels) * current_loss_weight
-
-    # 旧模型一致性约束项（鼓励与旧模型输出差异）
-    consistency_loss = 0
-    for old_features in old_features_list:
-        # 计算特征相似度（鼓励差异）
-        # similarity = F.cosine_similarity(current_features, old_features, dim=1)  # [B]
-        similarity = torch.sum((current_features - old_features) ** 2, dim=1)  # [B]
-        consistency_loss += similarity.mean()  # 最大化差异即最小化相似度
-
-    # 总损失 = 分类损失 - 相似度损失（因为要最小化总损失，等价于最大化差异）
-    total_loss = loss_current - old_consistency_weight * consistency_loss
-
-    return total_loss
-
-
-def weighted_prompt_average(_prompt: dict, prompt_: dict, alpha: float) -> dict:
-    """
-    对两个OrderedDict结构的PromptTokens进行加权平均
-    参数：
-        _prompt: 旧Prompt字典（含各层参数）
-        prompt_: 新Prompt字典（含各层参数）
-        alpha: 新Prompt的权重（0.5表示各占50%）
-    返回：
-        new_prompt: 加权后的新Prompt字典
-    """
+def weighted_prompt_average(_prompt: dict, prompt_: dict, alpha: float, beta=0.5) -> dict:
     new_prompt = type(prompt_)()  # 保持原有结构（如OrderedDict）
 
     # 确保键完全一致
@@ -349,11 +302,63 @@ def weighted_prompt_average(_prompt: dict, prompt_: dict, alpha: float) -> dict:
         val_prompt = prompt_[key]
         val_old = _prompt[key]
 
-        # 递归处理嵌套的OrderedDict（如多层级结构）
-        if isinstance(val_prompt, dict):
-            new_prompt[key] = weighted_prompt_average(val_old, val_prompt, alpha)
+        if np.random.uniform(0, 1) < beta and alpha > 0.0:
+            # 递归处理嵌套的OrderedDict（如多层级结构）
+            if isinstance(val_prompt, dict):
+                new_prompt[key] = weighted_prompt_average(val_old, val_prompt, alpha, beta)
+            else:
+                # 对Tensor进行加权计算
+                new_prompt[key] = (1 - alpha) * val_old + alpha * val_prompt
         else:
-            # 对Tensor进行加权计算
-            new_prompt[key] = (1 - alpha) * val_old + alpha * val_prompt
+            new_prompt[key] = val_old
 
     return new_prompt
+
+
+def weighted_adapter_average(old_adapter, new_adapter, alpha):
+    # 创建新 Adapter 实例（继承原配置）
+    vit = VisionTransformer()
+    merged_adapter = vit.cur_adapter
+
+    # 合并参数
+    merged_state_dict = {}
+    for key in old_adapter.state_dict():
+        old_val = old_adapter.state_dict()[key]
+        new_val = new_adapter.state_dict()[key]
+        merged_state_dict[key] = (1 - alpha) * old_val + alpha * new_val
+
+    # 加载合并后的参数到新实例（使用 assign=True 保持参数属性）
+    merged_adapter.load_state_dict(merged_state_dict, assign=True)
+
+    return merged_adapter
+
+
+class FeatureDataset(Dataset):
+    def __init__(self, old_features_list, new_features_list, transform=None):
+        """
+        将新旧特征列表转换为PyTorch Dataset
+        Args:
+            old_features_list (list): 旧模型特征列表，每个元素为(batch_size, feature_dim)张量
+            new_features_list (list): 新模型特征列表，每个元素形状与old_features_list对应
+            transform (callable, optional): 可选的同步特征变换函数
+        """
+        # 拼接所有批次的特征张量 (总_samples, feature_dim)
+        self.old_features = torch.cat(old_features_list, dim=0)
+        self.new_features = torch.cat(new_features_list, dim=0)
+        self.transform = transform
+
+        # 维度校验 (确保新旧特征对齐)
+        assert len(self.old_features) == len(self.new_features), "特征数量不匹配"
+        assert self.old_features.shape[1] == self.new_features.shape[1], "特征维度不匹配"
+
+    def __len__(self):
+        return self.old_features.size(0)
+
+    def __getitem__(self, idx):
+        old_feat = self.old_features[idx]
+        new_feat = self.new_features[idx]
+
+        if self.transform:
+            old_feat, new_feat = self.transform(old_feat, new_feat)
+
+        return old_feat, new_feat
